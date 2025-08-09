@@ -1,12 +1,13 @@
-import os, json
+import os
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from openai import OpenAI
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
 
 load_dotenv()
 
@@ -17,12 +18,15 @@ PINECONE_INDEX = os.getenv("PINECONE_INDEX", "ortahaus")
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "prod")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 
+if not PINECONE_API_KEY:
+    raise RuntimeError("PINECONE_API_KEY is not set")
+
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
 
 client = OpenAI()
 
-app = FastAPI()
+app = FastAPI(title="Ortahaus Chatbot API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
@@ -31,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the simple UI
+# Serve the demo UI from /ui and redirect root -> /ui
 app.mount("/ui", StaticFiles(directory="web", html=True), name="ui")
 
 @app.get("/")
@@ -46,18 +50,21 @@ class ChatOut(BaseModel):
     reply: str
 
 SYSTEM = (
-    "You are the Ortahaus Product Guide. Only answer about Ortahaus products. "
-    "Always recommend at least two different products, with links. "
-    "Ask brief follow-ups if hair info is missing: hair type, main concern, finish/hold."
+    "You are the Ortahaus Product Guide. Only answer about Ortahaus products sold on ortahaus.com. "
+    "Always recommend at least two different products with links. "
+    "Ask one brief follow-up if hair info is missing: hair type, main concern, finish/hold. "
+    "Return short HTML lines, one per product, each with an <a href=\"...\" target=\"_blank\" rel=\"noopener\">Name</a> — reason."
 )
 
 TEMPLATE = (
     "User profile: {profile}\n\n"
-    "Top candidate products (JSON):\n"
-    "{products}\n\n"
-    "Task: Based on the user message, write a short reply that mentions at least 2 different products. "
-    "For each product, include a one-line reason and the product URL. Keep it concise and friendly. "
-    "If the user asks about non-product topics, refuse and pivot back.\n\n"
+    "Top candidate products (JSON):\n{products}\n\n"
+    "Task: Write a SHORT HTML reply.\n"
+    "- If needed, start with ONE brief follow-up question.\n"
+    "- Then recommend AT LEAST TWO different products from the list above.\n"
+    "- For each product, output exactly:\n"
+    '  <a href="URL" target="_blank" rel="noopener">Product Name</a> — one-line reason\n'
+    "- No markdown. No extra HTML wrapper. Just lines of HTML.\n\n"
     "User message: {message}\n"
 )
 
@@ -115,6 +122,7 @@ def chat(body: ChatIn):
 
     products = search_products(msg)
     if not products:
+        # Fallback nudge if nothing retrieved
         return {"reply": "I can help with Ortahaus products. Tell me your hair type and main goal, and I’ll suggest two options."}
 
     prompt = TEMPLATE.format(
