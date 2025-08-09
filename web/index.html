@@ -8,9 +8,11 @@
   <body>
     <h1>Ortahaus Chatbot — Staging</h1>
     <p>This page loads the floating chat button in the bottom right.</p>
-    <script>
-      window.WIDGET_API_BASE = 'http://localhost:8000';
-    </script>
+<script>
+  // If the UI is served by the same backend, this just works.
+  window.WIDGET_API_BASE = location.origin;
+</script>
+<script src="./widget.js"></script>
     <script src="./widget.js"></script>
   </body>
 </html>
