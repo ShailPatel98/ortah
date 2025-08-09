@@ -1,5 +1,8 @@
 import os
 import json
+import re
+from typing import List, Dict, Any
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +26,6 @@ if not PINECONE_API_KEY:
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
-
 client = OpenAI()
 
 app = FastAPI(title="Ortahaus Chatbot API")
@@ -51,27 +53,30 @@ class ChatOut(BaseModel):
 
 SYSTEM = (
     "You are the Ortahaus Product Guide. Only answer about Ortahaus products sold on ortahaus.com. "
-    "Always recommend at least two different products with links. "
-    "Ask one brief follow-up if hair info is missing: hair type, main concern, finish/hold. "
-    "Return short HTML lines, one per product, each with an <a href=\"...\" target=\"_blank\" rel=\"noopener\">Name</a> — reason."
+    "Be warm, concise, and human. Ask ONE brief follow-up if key info is missing (hair type / main concern / finish-hold). "
+    "If there’s a clear best match recommend ONE product; otherwise recommend TWO max. "
+    "Return SHORT HTML lines. For each product: "
+    "<a href=\"URL\" target=\"_blank\" rel=\"noopener\">Product Name</a> — why it fits. "
+    "Optionally add: <span class=\"hint\">How to use: …</span>."
 )
 
 TEMPLATE = (
-    "User profile: {profile}\n\n"
-    "Top candidate products (JSON):\n{products}\n\n"
-    "Task: Write a SHORT HTML reply.\n"
-    "- If needed, start with ONE brief follow-up question.\n"
-    "- Then recommend AT LEAST TWO different products from the list above.\n"
-    "- For each product, output exactly:\n"
-    '  <a href="URL" target="_blank" rel="noopener">Product Name</a> — one-line reason\n'
-    "- No markdown. No extra HTML wrapper. Just lines of HTML.\n\n"
+    "User profile (may be None): {profile}\n\n"
+    "Candidate products (JSON list, each has title,url,tags plus scraped fields like attributes, bullets, how_to_use, ingredients):\n"
+    "{products}\n\n"
+    "Task:\n"
+    "1) If missing hair info, start with ONE short follow-up question.\n"
+    "2) Then recommend ONE best product; if ambiguous recommend TWO max.\n"
+    "3) Use the scraped fields to justify (hair type/concern/finish/hold/benefits). Keep it short and human.\n"
+    "4) Output HTML only, with one line per product:\n"
+    "   <a href=\"URL\" target=\"_blank\" rel=\"noopener\">Product Name</a> — why it fits. <span class=\"hint\">How to use: …</span>\n\n"
     "User message: {message}\n"
 )
 
-def embed(text: str):
+def embed(text: str) -> List[float]:
     return client.embeddings.create(model=OPENAI_MODEL_EMBED, input=text).data[0].embedding
 
-def search_products(query: str, top_k=6):
+def search_products(query: str, top_k=8) -> List[Dict[str, Any]]:
     qvec = embed(query)
     res = index.query(
         namespace=PINECONE_NAMESPACE,
@@ -88,6 +93,11 @@ def search_products(query: str, top_k=6):
             "url": md.get("url"),
             "image": md.get("image"),
             "tags": md.get("tags"),
+            # parsed enrichments (may be absent)
+            "attributes": md.get("attributes"),
+            "bullets": md.get("bullets"),
+            "how_to_use": md.get("how_to_use"),
+            "ingredients": md.get("ingredients"),
             "score": m.get("score"),
         })
     return items
@@ -99,8 +109,8 @@ def chat_openai(system: str, prompt: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.2,
-        max_tokens=350,
+        temperature=0.4,
+        max_tokens=380,
     )
     return resp.choices[0].message.content
 
@@ -115,19 +125,18 @@ def chat(body: ChatIn):
         raise HTTPException(400, "message is required")
 
     profile = {
-        "hair_type": body.context.get("hair_type") if body.context else None,
-        "concern": body.context.get("concern") if body.context else None,
-        "finish": body.context.get("finish") if body.context else None,
+        "hair_type": (body.context or {}).get("hair_type"),
+        "concern":   (body.context or {}).get("concern"),
+        "finish":    (body.context or {}).get("finish"),
     }
 
     products = search_products(msg)
     if not products:
-        # Fallback nudge if nothing retrieved
-        return {"reply": "I can help with Ortahaus products. Tell me your hair type and main goal, and I’ll suggest two options."}
+        return {"reply": "I can help with Ortahaus products. Tell me your hair type and main goal, and I’ll suggest a product."}
 
     prompt = TEMPLATE.format(
         profile=json.dumps(profile),
-        products=json.dumps(products[:6], ensure_ascii=False),
+        products=json.dumps(products[:8], ensure_ascii=False),
         message=msg,
     )
     text = chat_openai(SYSTEM, prompt)
