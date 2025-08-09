@@ -8,3 +8,4 @@ beautifulsoup4==4.12.3
 lxml==5.2.2
 pinecone-client==5.0.1
 pydantic==2.8.2
+aiofiles==23.2.1
