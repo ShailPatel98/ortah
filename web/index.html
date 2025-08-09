@@ -6,13 +6,11 @@
     <title>Ortahaus Chatbot — Staging</title>
   </head>
   <body>
-    <h1>Ortahaus Chatbot — Staging</h1>
-    <p>This page loads the floating chat button in the bottom right.</p>
-<script>
-  // If the UI is served by the same backend, this just works.
-  window.WIDGET_API_BASE = location.origin;
-</script>
-<script src="./widget.js"></script>
+    <!-- The widget injects itself -->
+    <script>
+      // If this UI is served by the same backend, this auto-points to your API
+      window.WIDGET_API_BASE = location.origin;
+    </script>
     <script src="./widget.js"></script>
   </body>
 </html>
