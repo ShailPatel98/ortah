@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from openai import OpenAI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 
 load_dotenv()
 
@@ -28,6 +30,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve the simple UI
+app.mount("/ui", StaticFiles(directory="web", html=True), name="ui")
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/ui")
 
 class ChatIn(BaseModel):
     message: str
