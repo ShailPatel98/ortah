@@ -7,17 +7,16 @@ from dotenv import load_dotenv
 load_dotenv()
 BASE_URL = os.getenv("BASE_URL", "https://ortahaus.com").rstrip("/")
 OUT_PATH = os.path.join("data", "products.json")
-HEADERS = {"User-Agent": "OrtahausBot/0.2 (contact: staging@example.com)"}
+HEADERS = {"User-Agent": "OrtahausBot/0.3 (contact: staging@example.com)"}
 
 os.makedirs("data", exist_ok=True)
 PRODUCTS = {}
 
-# ---- helpers ---------------------------------------------------------------
+# ---------- helpers ----------
 
 def get(url):
     r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    return r
+    r.raise_for_status(); return r
 
 def parse_sitemap(url):
     soup = BeautifulSoup(get(url).text, "xml")
@@ -35,42 +34,35 @@ def shopify_product_json(product_url):
         return None
     return None
 
-def try_ld_json(html):
-    soup = BeautifulSoup(html, "lxml")
-    for s in soup.find_all("script", {"type":"application/ld+json"}):
-        try:
-            data = json.loads(s.text.strip())
-            if isinstance(data, dict) and data.get("@type") in ("Product","BreadcrumbList"):
-                return data
-        except Exception:
-            continue
-    return None
+PAYMENT_WORDS = {"visa","mastercard","apple pay","google pay","paypal","diners","discover","shop pay","amex","affirm","klarna","venmo","afterpay","pay in 4","% off","deliver every"}
 
-def extract_text_blocks(soup):
-    # Try to grab meaningful bullets/sections from PDP
-    blocks = []
-    # common content area; fallback to all <li> and <p>
-    for sel in ["section", ".product", ".product__description", ".rte", "main", "body"]:
+def meaningful_lines(soup):
+    lines = []
+    for sel in [".product", ".product__description", ".rte", "main", "section", "body"]:
         for el in soup.select(sel):
             for li in el.find_all("li"):
                 t = " ".join(li.get_text(" ", strip=True).split())
-                if len(t) > 0 and len(t) <= 300:
-                    blocks.append(t)
+                if 2 <= len(t) <= 220: lines.append(t)
             for p in el.find_all("p"):
                 t = " ".join(p.get_text(" ", strip=True).split())
-                if 20 <= len(t) <= 300:
-                    blocks.append(t)
+                if 20 <= len(t) <= 300: lines.append(t)
+    # clean: drop payment / promo noise
+    cleaned = []
+    for t in lines:
+        L = t.lower()
+        if any(w in L for w in PAYMENT_WORDS): continue
+        cleaned.append(t)
     # de-dup
     seen, uniq = set(), []
-    for t in blocks:
+    for t in cleaned:
         if t not in seen:
             seen.add(t); uniq.append(t)
     return uniq[:20]
 
-HAIR_TYPES = ["fine", "thick", "coarse", "medium", "straight", "wavy", "curly", "coily"]
-CONCERNS = ["volume", "frizz", "dry", "dryness", "oily", "oiliness", "hold", "definition", "shine", "matte"]
-FINISHES = ["matte", "natural", "satin", "shine", "gloss"]
-HOLDS = ["light", "medium", "firm", "strong", "high"]
+HAIR_TYPES = ["fine","thick","coarse","medium","straight","wavy","curly","coily"]
+CONCERNS = ["volume","volumizing","frizz","dry","dryness","oily","oiliness","definition","shine","matte","hydration","hold","strong hold","firm hold","light hold","medium hold"]
+FINISHES = ["matte","natural","satin","shine","gloss"]
+HOLDS = ["light","medium","firm","strong","high"]
 
 def infer_attributes(text):
     L = text.lower()
@@ -83,11 +75,16 @@ def infer_attributes(text):
         if re.search(rf"\\b{re.escape(w)}\\b", L): attrs["finish"].append(w)
     for w in HOLDS:
         if re.search(rf"\\b{re.escape(w)}\\b", L): attrs["hold"].append(w)
-    # unique
     for k in attrs: attrs[k] = sorted(list(set(attrs[k])))
     return attrs
 
-# ---- main scraping ---------------------------------------------------------
+def section_after(label, text, maxlen=260):
+    for pat in [label, label.upper(), label.title()]:
+        m = re.search(rf"{re.escape(pat)}[\\s:\\-]+(.{{20,{maxlen}}})", text, flags=re.IGNORECASE)
+        if m: return m.group(1).strip()
+    return ""
+
+# ---------- scrape ----------
 
 def scrape_product(url):
     data = {
@@ -108,40 +105,23 @@ def scrape_product(url):
     html = get(url).text
     soup = BeautifulSoup(html, "lxml")
 
-    # Fallback title/desc
     if not data["title"] and soup.title:
         data["title"] = soup.title.get_text(strip=True)
     mdesc = soup.find("meta", {"name":"description"})
     if (not data["description"]) and mdesc and mdesc.get("content"):
         data["description"] = mdesc["content"].strip()
 
-    # Pull bullets/paragraphs & infer attributes
-    blocks = extract_text_blocks(soup)
+    blocks = meaningful_lines(soup)
     data["bullets"] = blocks[:12]
 
-    # Try headings for "How to use" / "Ingredients"
-    text = soup.get_text(" ", strip=True)
-    # naive splits
-    for label in ["How to use", "HOW TO USE", "How To Use"]:
-        m = re.search(rf"{label}[:\\-\\s]+(.{{20,200}})", text)
-        if m:
-            data["how_to_use"] = m.group(1).strip()
-            break
-    for label in ["Ingredients", "INGREDIENTS"]:
-        m = re.search(rf"{label}[:\\-\\s]+(.{{20,300}})", text)
-        if m:
-            data["ingredients"] = m.group(1).strip()
-            break
+    all_text = soup.get_text(" ", strip=True)
+    data["how_to_use"] = section_after("How to use", all_text, 220)
+    data["ingredients"] = section_after("Ingredients", all_text, 300)
 
-    # Attributes inferred from all text we have
-    big_text = " ".join(filter(None, [
-        data.get("title") or "",
-        data.get("description") or "",
-        " ".join(blocks)
-    ]))
+    # Infer attributes from consolidated text
+    big_text = " ".join(filter(None, [data.get("title") or "", data.get("description") or "", " ".join(blocks)]))
     data["attributes"] = infer_attributes(big_text)
 
-    # Clean images
     if not data["images"]:
         for img in soup.select("img"):
             src = img.get("src") or img.get("data-src")
