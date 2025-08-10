@@ -1,230 +1,270 @@
 import os
+import json
+import uuid
 import re
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
 from pydantic import BaseModel
 
-# --- OpenAI (embeddings) ---
-try:
-    # new SDK
-    from openai import OpenAI
-    _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    def embed(text: str) -> List[float]:
-        resp = _client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text.strip()
-        )
-        return resp.data[0].embedding
-except Exception:
-    # fallback to legacy import name if needed
-    import openai
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    def embed(text: str) -> List[float]:
-        resp = openai.Embedding.create(
-            model="text-embedding-3-small",
-            input=text.strip()
-        )
-        return resp["data"][0]["embedding"]
+# --- OpenAI (chat + embeddings) ---
+from openai import OpenAI
 
 # --- Pinecone ---
 from pinecone import Pinecone
 
-PC = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-INDEX_NAME = os.getenv("PINECONE_INDEX", "ortahaus")
-NAMESPACE = os.getenv("PINECONE_NAMESPACE", "prod")
-INDEX = PC.Index(INDEX_NAME)
+# =========================
+# Environment
+# =========================
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL_CHAT = os.environ.get("OPENAI_MODEL_CHAT", "gpt-4o-mini")
+OPENAI_MODEL_EMBED = os.environ.get("OPENAI_MODEL_EMBED", "text-embedding-3-small")
 
-# ---------- FastAPI ----------
-app = FastAPI(title="Ortahaus Chat API", version="1.0.0")
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
+PINECONE_ENV = os.environ.get("PINECONE_ENV", "us-east-1")  # not required for serverless v2 but kept
+PINECONE_INDEX = os.environ.get("PINECONE_INDEX", "ortahaus")
+PINECONE_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "prod")
+
+BASE_URL = os.environ.get("BASE_URL", "https://ortahaus.com")
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
+PORT = int(os.environ.get("PORT", "8000"))
+
+# =========================
+# App
+# =========================
+app = FastAPI(title="Ortahaus Chat")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten if you want
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Simple in-memory session store ----------
-# Note: This resets when the server restarts. Good enough for MVP.
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+# Serve static UI
+if not os.path.isdir("static"):
+    os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# slot vocab
-HAIR_TYPES = ["straight", "wavy", "curly", "coily", "fine", "thick"]
-CONCERNS = [
-    "volume", "frizz", "hold", "shine", "hydration", "definition", "texture", "control"
-]
+@app.get("/")
+def root():
+    # Redirect to /ui
+    return HTMLResponse('<meta http-equiv="refresh" content="0; url=/ui">')
 
-def find_keyword(text: str, options: List[str]) -> Optional[str]:
-    t = text.lower()
-    for opt in options:
-        # allow simple variations like "frizzy" -> "frizz"
-        if opt == "frizz" and ("frizz" in t or "frizzy" in t):
-            return "frizz"
-        if opt in t:
-            return opt
-    return None
+@app.get("/ui")
+def ui():
+    index_path = os.path.join("static", "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return HTMLResponse("<h1>UI not found</h1><p>Put your index.html under /static.</p>", status_code=200)
 
-def get_session(session_id: str) -> Dict[str, Any]:
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = {
-            "hair_type": None,
-            "concern": None,
-            "history": []  # [{role:"user"/"assistant", "content": "..."}]
-        }
-    return SESSIONS[session_id]
-
-def reset_session(session_id: str):
-    if session_id in SESSIONS:
-        SESSIONS.pop(session_id, None)
-
-# ---------- Models ----------
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
-
-class ChatResponse(BaseModel):
-    reply_html: str
-    hair_type: Optional[str]
-    concern: Optional[str]
-
-# ---------- Health ----------
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
-# ---------- Helpers ----------
+# =========================
+# Clients
+# =========================
+if OPENAI_API_KEY:
+    oai = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    oai = None
+
+pc = Pinecone(api_key=PINECONE_API_KEY)
+idx = pc.Index(PINECONE_INDEX)
+
+# =========================
+# Simple in-memory session
+# =========================
+# NOTE: This resets on redeploy. If you want persistence, swap for Redis.
+SESSION_STORE: Dict[str, Dict[str, Any]] = {}
+
+def get_session(session_id: Optional[str]) -> str:
+    if session_id and session_id in SESSION_STORE:
+        return session_id
+    new_id = str(uuid.uuid4())
+    SESSION_STORE[new_id] = {"history": [], "facts": {}}
+    return new_id
+
+# =========================
+# RAG helpers
+# =========================
+def sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """ Pinecone requires string/number/bool or list of strings. No nulls. """
+    out: Dict[str, Any] = {}
+    for k, v in (meta or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        elif isinstance(v, list):
+            # only lists of strings allowed
+            out[k] = [str(x) for x in v if x is not None]
+        else:
+            # coerce to string
+            out[k] = str(v)
+    return out
+
+def embed_text(text: str) -> List[float]:
+    if not oai:
+        raise RuntimeError("OpenAI client not configured.")
+    text = text.replace("\n", " ")
+    emb = oai.embeddings.create(model=OPENAI_MODEL_EMBED, input=text)
+    return emb.data[0].embedding
+
 def pinecone_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    try:
-        v = embed(query)
-        result = INDEX.query(
-            vector=v,
-            top_k=top_k,
-            include_metadata=True,
-            namespace=NAMESPACE
-        )
-        # normalize into list of {id, score, metadata}
-        hits = []
-        for m in getattr(result, "matches", []) or []:
-            hits.append({
-                "id": m.id,
-                "score": float(m.score) if m.score is not None else 0.0,
-                "metadata": dict(m.metadata or {})
-            })
-        return hits
-    except Exception as e:
-        # keep bot alive even if vector search hiccups
-        return []
-
-def format_product_card(meta: Dict[str, Any]) -> str:
-    title = meta.get("title") or meta.get("name") or "View product"
-    url = meta.get("url") or meta.get("link") or "#"
-    how_to_use = (meta.get("how_to_use") or "").strip()
-    bullets = meta.get("bullets") or []
-    ingredients = (meta.get("ingredients") or "").strip()
-
-    # Make sure link opens in a new tab + is safe
-    link_html = f'<a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a>'
-
-    # Human‑y single recommendation
-    parts = [f"I’d try <strong>{link_html}</strong>."]
-    if how_to_use:
-        parts.append(f"<br><em>How to use:</em> {how_to_use}")
-    elif bullets and isinstance(bullets, list):
-        # show a short highlight if available
-        parts.append(f"<br>{bullets[0]}")
-    if ingredients:
-        parts.append(f"<br><em>Key info:</em> {ingredients}")
-
-    return "".join(parts)
-
-def make_query_text(hair_type: str, concern: str) -> str:
-    # steer search toward relevant copy
-    return (
-        f"Ortahaus product best for hair_type={hair_type}, concern={concern}. "
-        "Prefer single hero product. Use metadata fields title, url, how_to_use, ingredients, bullets if present."
+    v = embed_text(query)
+    res = idx.query(
+        namespace=PINECONE_NAMESPACE,
+        vector=v,
+        top_k=top_k,
+        include_metadata=True,
     )
+    # v5 returns dict-like results with "matches"
+    matches = getattr(res, "matches", None) or res.get("matches", [])
+    out = []
+    for m in matches:
+        md = sanitize_metadata(m.get("metadata") or {})
+        out.append({
+            "id": m.get("id"),
+            "score": float(m.get("score", 0.0)),
+            "metadata": md
+        })
+    return out
 
-def needs_more(reply: str) -> bool:
-    # If user asked for 'more', 'another', 'second', etc.
-    return bool(re.search(r"\b(more|another|second|else)\b", reply.lower()))
+def format_product_card(m: Dict[str, Any]) -> str:
+    md = m["metadata"]
+    title = md.get("title") or "Product"
+    url = md.get("url") or BASE_URL
+    desc = md.get("description") or ""
+    price = md.get("price")
+    price_txt = f" – ${price}" if price else ""
+    # open in new tab
+    return f'<a href="{url}" target="_blank" rel="noopener noreferrer"><strong>{title}</strong></a>{price_txt}<br/>{desc}'
 
-# ---------- Chat ----------
-INTRO_PROMPT = (
-    "Hi! I’m the Ortahaus Product Guide. I can recommend something based on your hair and goals. "
-    "Tell me your hair type and your main concern (e.g., volume, strong hold, frizz control, shine, hydration)."
+# =========================
+# Prompting / Chat flow
+# =========================
+SYSTEM_PROMPT = (
+    "You are the Ortahaus Product Guide. Talk like a helpful retail associate: concise, friendly, no fluff.\n"
+    "Collect only missing info, then make a single confident recommendation.\n"
+    "If the user already gave enough info (hair type and main concern), recommend one product.\n"
+    "If you are not sure, ask one follow-up question, then recommend.\n"
+    "When referencing products, prefer using the exact product titles from context documents.\n"
+    "Always keep your answers short (2–5 sentences)."
 )
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    # quick resets
-    if req.message.strip().lower() in {"reset", "restart", "start over"}:
-        reset_session(req.session_id)
-        return ChatResponse(reply_html=INTRO_PROMPT, hair_type=None, concern=None)
+WELCOME_MESSAGE = (
+    "Hi! I’m the Ortahaus Product Guide. Tell me your hair type and your top concern "
+    "(e.g., volume, frizz, shine, or hold), and I’ll recommend the best product."
+)
 
-    session = get_session(req.session_id)
-    user_text = req.message.strip()
+class ChatIn(BaseModel):
+    session_id: Optional[str] = None
+    message: str
 
-    # update known slots if the user volunteered them
-    if not session["hair_type"]:
-        ht = find_keyword(user_text, HAIR_TYPES)
-        if ht:
-            session["hair_type"] = ht
+class ChatOut(BaseModel):
+    session_id: str
+    reply_html: str
 
-    if not session["concern"]:
-        cz = find_keyword(user_text, CONCERNS)
-        if cz:
-            session["concern"] = cz
+@app.get("/welcome")
+def welcome():
+    return {"message": WELCOME_MESSAGE}
 
-    # slot-filling: only ask what’s missing
-    if not session["hair_type"]:
-        return ChatResponse(
-            reply_html="Got it! What’s your hair type — straight, wavy, curly, coily, fine, or thick?",
-            hair_type=None,
-            concern=session["concern"]
-        )
+@app.post("/chat", response_model=ChatOut)
+def chat(body: ChatIn):
+    session_id = get_session(body.session_id)
+    session = SESSION_STORE[session_id]
 
-    if not session["concern"]:
-        return ChatResponse(
-            reply_html=(
-                "Thanks! What’s the main goal today — volume, frizz control, strong hold, shine, hydration, "
-                "definition, texture, or overall control?"
-            ),
-            hair_type=session["hair_type"],
-            concern=None
-        )
+    user_msg = (body.message or "").strip()
+    session["history"].append({"role": "user", "content": user_msg})
 
-    # We have both slots → search and recommend
-    query = make_query_text(session["hair_type"], session["concern"])
+    # Simple fact extraction for hair type / concern based on user text (quick rules)
+    facts = session.setdefault("facts", {})
+    # Extract hair type if mentioned
+    hair_types = ["straight", "wavy", "curly", "coily", "fine", "thick"]
+    if "hair_type" not in facts:
+        for ht in hair_types:
+            if re.search(rf"\b{ht}\b", user_msg, re.I):
+                facts["hair_type"] = ht
+                break
+    # Extract main concern
+    concerns = ["volume", "frizz", "shine", "hold", "hydration", "definition", "control", "oily", "dry"]
+    if "concern" not in facts:
+        for c in concerns:
+            if re.search(rf"\b{c}\b", user_msg, re.I):
+                facts["concern"] = c
+                break
 
-    # If the user also typed extra context (“want matte finish” etc.), add it
-    extra = user_text.lower()
-    if extra and extra not in {"ok", "thanks", "thank you"}:
-        query += f" Extra preferences: {extra}"
+    # Decide whether to ask or answer
+    missing: List[str] = []
+    if "hair_type" not in facts:
+        missing.append("hair type")
+    if "concern" not in facts:
+        missing.append("main concern")
 
-    hits = pinecone_search(query, top_k=5)
+    if missing:
+        # Ask for only one missing thing at a time
+        ask = missing[0]
+        reply = f"Got it. What is your {ask}?"
+        session["history"].append({"role": "assistant", "content": reply})
+        return ChatOut(session_id=session_id, reply_html=reply)
 
-    if not hits:
-        # Graceful fallback
-        reply = (
-            f"Based on **{session['hair_type']}** hair and **{session['concern']}**, "
-            "I’d look at our styling and care best‑sellers. Want me to try again with a different priority "
-            "(e.g., ‘more shine’, ‘matte finish’, ‘lighter hold’)?"
-        )
-        return ChatResponse(reply_html=reply, hair_type=session["hair_type"], concern=session["concern"])
+    # We have both hair_type and concern: search Pinecone and recommend one product
+    search_query = f"{facts['hair_type']} hair {facts['concern']} best product site:{BASE_URL}"
+    results = pinecone_search(search_query, top_k=4)
 
-    # Choose the single best hit
-    top = hits[0]
-    product_html = format_product_card(top.get("metadata", {}))
+    # Build a compact answer using OpenAI with the snippets for tone, but guard if OpenAI down.
+    context_snippets = []
+    for m in results:
+        md = m["metadata"]
+        snippet = f"TITLE: {md.get('title','')}\nURL: {md.get('url','')}\nDESC: {md.get('description','')}\nBULLETS: {', '.join(md.get('bullets', [])[:5])}\n"
+        context_snippets.append(snippet)
+    context = "\n---\n".join(context_snippets) if context_snippets else ""
 
-    # conversational, single rec; we’ll only add more if the user asks
-    opener = f"Great — for {session['hair_type']} hair and {session['concern']}, here’s what I’d go with:"
-    reply_html = f"{opener}<br><br>{product_html}<br><br>Want a second option or something with a different finish?"
-
-    return ChatResponse(
-        reply_html=reply_html,
-        hair_type=session["hair_type"],
-        concern=session["concern"]
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"User hair type: {facts['hair_type']}\n"
+        f"User main concern: {facts['concern']}\n\n"
+        f"Context (top products):\n{context}\n\n"
+        f"Write a short recommendation (2–5 sentences). Mention exactly one product by its exact title "
+        f"and why it fits. Do not invent details."
     )
+
+    try:
+        ai = oai.chat.completions.create(
+            model=OPENAI_MODEL_CHAT,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.6,
+        )
+        text = ai.choices[0].message.content.strip()
+    except Exception:
+        # Fallback if OpenAI has a transient issue
+        if results:
+            top = results[0]
+            text = (
+                f"For {facts['hair_type']} hair and {facts['concern']}, try "
+                f"{top['metadata'].get('title','this product')}. "
+                f"It matches what you asked for. "
+            )
+        else:
+            text = "I couldn’t find a match right now. Could you share a bit more about the style or finish you want?"
+
+    # Add a clean HTML product link to open in new tab
+    link_html = ""
+    if results:
+        best = results[0]
+        link_html = f"<p>{format_product_card(best)}</p>"
+
+    reply_html = f"<p>{text}</p>{link_html}"
+    session["history"].append({"role": "assistant", "content": reply_html})
+
+    return ChatOut(session_id=session_id, reply_html=reply_html)
