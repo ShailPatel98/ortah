@@ -1,16 +1,60 @@
 <!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Ortahaus Chatbot — Staging</title>
-  </head>
-  <body>
-    <!-- The widget injects itself -->
-    <script>
-      // If this UI is served by the same backend, this auto-points to your API
-      window.WIDGET_API_BASE = location.origin;
-    </script>
-    <script src="./widget.js"></script>
-  </body>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ortahaus Product Guide</title>
+  <style>
+    :root {
+      --bg: #0b0b0b;
+      --fg: #fafafa;
+      --muted: #b8b8b8;
+      --accent: #63e6be;
+      --card: #141414;
+      --shadow: 0 12px 30px rgba(0,0,0,.35);
+      --radius: 16px;
+    }
+    html,body{height:100%;}
+    body{margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Inter, Helvetica, Arial, sans-serif;}
+    a{color:var(--fg);}
+    .wrap{max-width:860px;margin:6vh auto;padding:0 16px;}
+    .card{background:var(--card); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden;}
+    header{padding:18px 20px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #222;}
+    header img{width:26px;height:26px;filter:grayscale(1) invert(1);}
+    header h1{font-size:16px;margin:0;letter-spacing:.4px; text-transform:uppercase;}
+    .chat{height:62vh; overflow:auto; padding:16px;}
+    .m{display:flex; gap:10px; margin:10px 0; align-items:flex-start;}
+    .m.you{justify-content:flex-end;}
+    .bubble{max-width:70%; padding:12px 14px; border-radius:14px; background:#1e1e1e;}
+    .m.you .bubble{background:#202c24; border:1px solid #335b45;}
+    .meta{color:var(--muted); font-size:12px; margin-top:4px;}
+    .input{display:flex; gap:8px; padding:12px; border-top:1px solid #222; background:#0f0f0f;}
+    .input input{flex:1; border-radius:12px; padding:12px 14px; border:1px solid #333; background:#151515; color:#fff; outline:none;}
+    .input button{border:0; padding:0 16px; border-radius:12px; background:var(--accent); color:#000; font-weight:600; cursor:pointer;}
+    .rec-link{color:#a7ffda; text-decoration:underline;}
+    .floating{position:fixed; right:22px; bottom:22px; z-index:50;}
+    .fab{width:56px; height:56px; border-radius:50%; background:var(--accent); border:0; box-shadow:var(--shadow); cursor:pointer; font-weight:800;}
+    .widget{position:fixed; right:22px; bottom:90px; width:360px; max-width:calc(100vw - 40px); display:none;}
+    .widget.open{display:block;}
+  </style>
+</head>
+<body>
+  <div class="floating">
+    <button id="fab" class="fab">ðŸ’¬</button>
+  </div>
+  <div id="widget" class="widget">
+    <div class="card">
+      <header>
+        <img src="https://ortahaus.com/cdn/shop/files/32_Pixel_Favicon_Sheep_Logo.png" alt="logo">
+        <h1>Ortahaus Product Guide</h1>
+      </header>
+      <div id="chat" class="chat"></div>
+      <div class="input">
+        <input id="msg" type="text" placeholder="Ask me anything about your hairâ€¦" />
+        <button id="send">Send</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/widget.js"></script>
+</body>
 </html>
